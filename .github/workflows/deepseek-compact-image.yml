@@ -1,0 +1,61 @@
+name: DeepSeek Compact Image
+
+on:
+  push:
+    branches:
+      - shenlp/deepseek-remote-compaction-v0.2.17
+    paths:
+      - .github/workflows/deepseek-compact-image.yml
+      - backend/go.mod
+      - backend/go.sum
+      - backend/internal/service/openai_gateway_deepseek_compact.go
+      - backend/internal/service/openai_gateway_deepseek_mapped_responses_test.go
+      - backend/internal/service/openai_gateway_deepseek_responses_history.go
+      - backend/internal/service/openai_gateway_forward.go
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deepseek-compact-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: Unit tests
+        working-directory: backend
+        run: |
+          go test ./internal/service/ -run 'TestEnsureDeepSeekResponsesReasoningPlaceholders|TestForwardResponses_MappedDeepSeek|TestForwardResponses_OfficialOpenAIStillStripsReasoningContent|TestForwardResponses_NativeDeepSeekInjectsReasoningPlaceholders|TestForwardOpenAIMappedDeepSeekRemoteCompactionSynthesizesOneItem|TestForwardOfficialOpenAIRemoteCompactionDoesNotSynthesize|TestForwardMappedDeepSeekRestoresOwnedCompactionAsUserCheckpoint|TestEnsureDeepSeekChatReasoningPlaceholders|TestForwardResponses_DeepSeekChatFallback' -count=1
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/sola97/sub2api:deepseek-compact-${{ github.sha }}
+          build-args: |
+            VERSION=0.2.17-deepseek-compact
+            COMMIT=${{ github.sha }}
+            DATE=${{ github.run_started_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

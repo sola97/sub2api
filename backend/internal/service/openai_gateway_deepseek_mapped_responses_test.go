@@ -44,6 +44,20 @@ func openaiMappedDeepSeekResponsesAccount() *Account {
 	}
 }
 
+func openaiCompatMappedDeepSeekResponsesAccount() *Account {
+	account := openaiMappedDeepSeekResponsesAccount()
+	account.ID = 19
+	account.Name = "openai-compat-deepseek-responses"
+	account.Credentials["base_url"] = "http://cli-proxy-api-tuwei-deepseek:8317/v1"
+	account.Credentials["model_mapping"] = map[string]any{
+		"gpt-5.5": "deepseek-flash",
+	}
+	account.Credentials["compact_model_mapping"] = map[string]any{
+		"gpt-5.5": "deepseek-flash",
+	}
+	return account
+}
+
 func nativeDeepSeekResponsesAccount() *Account {
 	return &Account{
 		ID:          11,
@@ -327,6 +341,33 @@ func TestForwardMappedDeepSeekRestoresOwnedCompactionAsUserCheckpoint(t *testing
 	require.Equal(t, "user", gjson.GetBytes(nextUpstream.lastBody, "input.0.role").String())
 	require.Contains(t, gjson.GetBytes(nextUpstream.lastBody, "input.0.content.0.text").String(), deepSeekRemoteCompactTestSummary)
 	require.False(t, gjson.GetBytes(nextUpstream.lastBody, `input.#(type=="compaction")`).Exists())
+}
+
+func TestForwardOpenAICompatMappedDeepSeekRemoteCompactionSynthesizesOneItem(t *testing.T) {
+	body := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{
+		"model": "gpt-5.5", "stream": true,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "Continue the compaction fix."},
+			map[string]any{"type": "compaction_trigger"},
+		},
+	})
+	c, recorder := deepSeekResponsesTestContext(t, body)
+	c.Request.Header.Set("X-Codex-Beta-Features", "remote_compaction_v2")
+	MarkOpenAINativeCompactionV2(c)
+	upstream := &httpUpstreamRecorder{resp: deepSeekRemoteCompactResponsesResponse(deepSeekRemoteCompactTestSummary)}
+	svc := &OpenAIGatewayService{cfg: deepSeekMappedResponsesTestConfig(), httpUpstream: upstream}
+
+	_, err := svc.Forward(deepSeekCompactTestContext(42), c, openaiCompatMappedDeepSeekResponsesAccount(), body)
+	require.NoError(t, err)
+	require.Equal(t, "deepseek-flash", gjson.GetBytes(upstream.lastBody, "model").String())
+	require.NotEqual(t, "compaction_trigger", gjson.GetBytes(upstream.lastBody, "input.1.type").String())
+
+	events := parseCompactBridgeSSE(t, recorder.Body.String())
+	require.Len(t, events, 2)
+	outputs := gjson.Get(events[1][1], "response.output").Array()
+	require.Len(t, outputs, 1)
+	require.Equal(t, "compaction", outputs[0].Get("type").String())
+	require.NotEmpty(t, outputs[0].Get("encrypted_content").String())
 }
 
 func mustMarshalDeepSeekCompactTestJSON(t *testing.T, value any) []byte {

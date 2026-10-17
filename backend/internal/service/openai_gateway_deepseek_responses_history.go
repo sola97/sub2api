@@ -35,7 +35,29 @@ func isDeepSeekResponsesUpstream(account *Account) bool {
 	if account.Platform == PlatformDeepseek {
 		return account.UsesNativeCNResponses()
 	}
-	return targetsDeepSeekAPIHost(account)
+	return targetsDeepSeekAPIHost(account) || accountRoutesToDeepSeekModels(account)
+}
+
+// accountRoutesToDeepSeekModels 识别通过兼容代理（例如 CLIProxyAPI）承接
+// DeepSeek 的 openai 平台账号。这里只认账号显式配置的模型映射，不能把普通
+// OpenAI 账号或未配置映射的账号误判成 DeepSeek。
+func accountRoutesToDeepSeekModels(account *Account) bool {
+	if account == nil || !account.IsOpenAI() {
+		return false
+	}
+	for _, requested := range []string{"gpt-5.5", "gpt-5.6-sol"} {
+		if isDeepSeekCatalogModel(account.GetMappedModel(requested)) {
+			return true
+		}
+	}
+	if mapping := account.GetCompactModelMapping(); len(mapping) > 0 {
+		for _, model := range mapping {
+			if isDeepSeekCatalogModel(model) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // responsesReasoningTextFromJSON 返回 reasoning item 的非空明文思维链，无明文时返回空串。

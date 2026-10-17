@@ -299,6 +299,10 @@ type OpenAIForwardResult struct {
 	wsReplayInput                []json.RawMessage
 	wsReplayInputExists          bool
 	wsAccountFailoverReplayInput []json.RawMessage
+	// wsDeepSeekCompactionCheckpoint marks a synthetic WebSocket compaction
+	// turn. The next frame must replay this checkpoint instead of chaining to
+	// the synthetic resp_* id, which the real upstream never stored.
+	wsDeepSeekCompactionCheckpoint json.RawMessage
 }
 
 // SucceededForScheduling reports whether this result is an upstream success

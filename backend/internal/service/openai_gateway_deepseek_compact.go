@@ -64,6 +64,56 @@ type deepSeekCompactStreamResult struct {
 	FirstTokenMs *int
 }
 
+type deepSeekRemoteCompactionResult struct {
+	ResponseID      string
+	ItemID          string
+	FinalJSON       []byte
+	Compaction      json.RawMessage
+	Usage           OpenAIUsage
+	TotalTokens     int
+	FirstTokenMs    *int
+	ResponseHeaders http.Header
+	Duration        time.Duration
+}
+
+type deepSeekRemoteCompactionHTTPError struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+	Message    string
+}
+
+func (e *deepSeekRemoteCompactionHTTPError) Error() string {
+	if e == nil {
+		return "DeepSeek compact upstream failed"
+	}
+	if strings.TrimSpace(e.Message) != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("DeepSeek compact upstream returned HTTP %d", e.StatusCode)
+}
+
+// isDeepSeekCompactBridgeModel limits the remote-compaction bridge to the
+// explicit gpt-5.5 -> deepseek-flash route. Other models on the same account,
+// including gpt-6.1-sol, keep their existing forwarding behavior.
+func isDeepSeekCompactBridgeModel(account *Account, requestedModel string) bool {
+	requestedModel = strings.TrimSpace(requestedModel)
+	if account == nil || !isDeepSeekResponsesUpstream(account) ||
+		!strings.EqualFold(lastOpenAIModelSegment(requestedModel), "gpt-5.5") {
+		return false
+	}
+	mappedModel, matched := account.ResolveMappedModel(requestedModel)
+	if !matched {
+		return false
+	}
+	mappedModel = normalizeOpenAIModelForUpstream(account, mappedModel)
+	return strings.EqualFold(lastOpenAIModelSegment(mappedModel), "deepseek-flash")
+}
+
+func shouldForceDeepSeekCompactWSBridge(account *Account, payload []byte) bool {
+	return isDeepSeekCompactBridgeModel(account, gjson.GetBytes(payload, "model").String())
+}
+
 func frameDeepSeekCompactSummary(summary string) string {
 	return deepSeekCompactCheckpointPreamble + "\n\n<compacted-summary>" + summary + "</compacted-summary>"
 }
@@ -348,7 +398,10 @@ func deepSeekCompactResponsesRequest(body []byte, upstreamModel string) ([]byte,
 		}
 		triggerIndex = i
 	}
-	if triggerIndex < 0 || triggerIndex != len(items)-1 {
+	if triggerIndex < 0 {
+		triggerIndex = len(items)
+	}
+	if triggerIndex != len(items)-1 && triggerIndex != len(items) {
 		return nil, errors.New("DeepSeek remote compaction requires a final compaction_trigger")
 	}
 	if triggerIndex == 0 {
@@ -648,6 +701,59 @@ func deepSeekCompactResponsesJSON(responseID, itemID, model, encryptedContent st
 	})
 }
 
+func deepSeekCompactResponseOutput(finalResponse []byte) (json.RawMessage, bool) {
+	output := gjson.GetBytes(finalResponse, "output")
+	if !output.IsArray() || len(output.Array()) != 1 {
+		return nil, false
+	}
+	item := output.Array()[0]
+	if !item.IsObject() || strings.TrimSpace(item.Get("type").String()) != "compaction" {
+		return nil, false
+	}
+	return json.RawMessage(item.Raw), true
+}
+
+func writeDeepSeekWSCompactionEvents(
+	finalResponse []byte,
+	writeClientMessage func([]byte) error,
+) error {
+	if writeClientMessage == nil {
+		return errors.New("client websocket writer is nil")
+	}
+	item, ok := deepSeekCompactResponseOutput(finalResponse)
+	if !ok {
+		return errors.New("synthesized DeepSeek compact response has one invalid output item")
+	}
+	responseID := strings.TrimSpace(gjson.GetBytes(finalResponse, "id").String())
+	if responseID == "" {
+		return errors.New("synthesized DeepSeek compact response has no id")
+	}
+	outputEvent, err := marshalOpenAIUpstreamJSON(map[string]any{
+		"type":            "response.output_item.done",
+		"sequence_number": 0,
+		"output_index":    0,
+		"item":            item,
+	})
+	if err != nil {
+		return fmt.Errorf("encode DeepSeek compact output item event: %w", err)
+	}
+	completedEvent, err := marshalOpenAIUpstreamJSON(map[string]any{
+		"type":            "response.completed",
+		"sequence_number": 1,
+		"response":        json.RawMessage(finalResponse),
+	})
+	if err != nil {
+		return fmt.Errorf("encode DeepSeek compact completed event: %w", err)
+	}
+	if err := writeClientMessage(outputEvent); err != nil {
+		return err
+	}
+	if err := writeClientMessage(completedEvent); err != nil {
+		return err
+	}
+	return nil
+}
+
 // shouldSynthesizeDeepSeekRemoteCompactionRequest 判断这次请求是否必须由网关合成
 // Codex remote compact v2 的 compaction item。
 //
@@ -656,13 +762,24 @@ func deepSeekCompactResponsesJSON(responseID, itemID, model, encryptedContent st
 // 看到 reasoning+message 两条输出、0 条 compaction，于是报
 // "remote compaction v2 expected exactly one compaction output item, got 0 from 2 output items"。
 func shouldSynthesizeDeepSeekRemoteCompactionRequest(c *gin.Context, account *Account, body []byte) bool {
-	if account == nil || !isDeepSeekResponsesUpstream(account) || !HasCompactionTriggerInInput(body) {
+	if !isDeepSeekCompactBridgeModel(account, gjson.GetBytes(body, "model").String()) {
 		return false
 	}
-	if isOpenAINativeCompactionV2(c) || gjson.GetBytes(body, "stream").Bool() {
+	if HasCompactionTriggerInInput(body) {
+		if isOpenAINativeCompactionV2(c) || gjson.GetBytes(body, "stream").Bool() {
+			return true
+		}
+		if isOpenAIResponsesCompactPath(c) {
+			return true
+		}
+	}
+	// The legacy /responses/compact endpoint carries the same history without a
+	// compaction_trigger item. Its response is a single compaction item, which
+	// DeepSeek /responses does not produce.
+	if isOpenAIResponsesCompactPath(c) {
 		return true
 	}
-	return isOpenAIResponsesCompactPath(c)
+	return false
 }
 
 func (s *OpenAIGatewayService) maybeForwardDeepSeekRemoteCompaction(
@@ -687,7 +804,7 @@ func (s *OpenAIGatewayService) maybeForwardDeepSeekRemoteCompaction(
 	return result, true, err
 }
 
-func (s *OpenAIGatewayService) forwardDeepSeekRemoteCompactionV2(
+func (s *OpenAIGatewayService) buildDeepSeekRemoteCompaction(
 	ctx context.Context,
 	c *gin.Context,
 	account *Account,
@@ -695,7 +812,7 @@ func (s *OpenAIGatewayService) forwardDeepSeekRemoteCompactionV2(
 	originalModel string,
 	billingModel string,
 	upstreamModel string,
-) (*OpenAIForwardResult, error) {
+) (*deepSeekRemoteCompactionResult, error) {
 	targetURL, token, err := s.deepSeekResponsesCompactUpstream(account)
 	if err != nil {
 		return nil, err
@@ -718,7 +835,17 @@ func (s *OpenAIGatewayService) forwardDeepSeekRemoteCompactionV2(
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= http.StatusBadRequest {
-		return s.handleErrorResponse(ctx, resp, c, account, responsesBody, billingModel)
+		body := s.readUpstreamErrorBody(resp)
+		message := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(body)))
+		if message == "" {
+			message = http.StatusText(resp.StatusCode)
+		}
+		return nil, &deepSeekRemoteCompactionHTTPError{
+			StatusCode: resp.StatusCode,
+			Headers:    resp.Header.Clone(),
+			Body:       body,
+			Message:    message,
+		}
 	}
 
 	streamResult, streamErr := s.readDeepSeekCompactResponsesStream(c, resp, startTime)
@@ -736,32 +863,135 @@ func (s *OpenAIGatewayService) forwardDeepSeekRemoteCompactionV2(
 	if err != nil {
 		return nil, fmt.Errorf("encode DeepSeek compact response: %w", err)
 	}
-	s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	compaction, ok := deepSeekCompactResponseOutput(finalJSON)
+	if !ok {
+		return nil, errors.New("synthesized DeepSeek compact response has an invalid output")
+	}
+	return &deepSeekRemoteCompactionResult{
+		ResponseID:      responseID,
+		ItemID:          itemID,
+		FinalJSON:       finalJSON,
+		Compaction:      compaction,
+		Usage:           streamResult.Usage,
+		TotalTokens:     streamResult.TotalTokens,
+		FirstTokenMs:    streamResult.FirstTokenMs,
+		ResponseHeaders: resp.Header.Clone(),
+		Duration:        time.Since(startTime),
+	}, nil
+}
+
+func (s *OpenAIGatewayService) forwardDeepSeekRemoteCompactionV2(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	originalModel string,
+	billingModel string,
+	upstreamModel string,
+) (*OpenAIForwardResult, error) {
+	compaction, err := s.buildDeepSeekRemoteCompaction(ctx, c, account, body, originalModel, billingModel, upstreamModel)
+	if err != nil {
+		var upstreamErr *deepSeekRemoteCompactionHTTPError
+		if errors.As(err, &upstreamErr) && upstreamErr != nil {
+			resp := &http.Response{
+				StatusCode: upstreamErr.StatusCode,
+				Header:     upstreamErr.Headers.Clone(),
+				Body:       io.NopCloser(bytes.NewReader(upstreamErr.Body)),
+			}
+			return s.handleErrorResponse(ctx, resp, c, account, body, billingModel)
+		}
+		return nil, err
+	}
+	s.bindHTTPResponseAccount(ctx, c, account, compaction.ResponseID)
 
 	clientStream := openAICompactClientWantsStream(c)
 	if clientStream {
-		if !writeOpenAICompactSSEBridge(c, http.StatusOK, finalJSON) {
+		if !writeOpenAICompactSSEBridge(c, http.StatusOK, compaction.FinalJSON) {
 			return nil, errors.New("failed to synthesize DeepSeek remote compaction response")
 		}
 	} else {
 		c.Header("Content-Type", "application/json")
-		c.Data(http.StatusOK, "application/json", finalJSON)
+		c.Data(http.StatusOK, "application/json", compaction.FinalJSON)
 	}
 
 	return &OpenAIForwardResult{
-		RequestID:             resp.Header.Get("x-request-id"),
-		ResponseID:            responseID,
-		Usage:                 streamResult.Usage,
+		RequestID:             compaction.ResponseHeaders.Get("x-request-id"),
+		ResponseID:            compaction.ResponseID,
+		Usage:                 compaction.Usage,
 		Model:                 originalModel,
 		BillingModel:          billingModel,
 		UpstreamModel:         upstreamModel,
 		UpstreamResponseModel: observedUpstreamResponseModel(c),
 		UpstreamEndpoint:      deepSeekResponsesEndpoint,
-		ReasoningEffort:       optionalTrimmedStringPtr(gjson.GetBytes(responsesBody, "reasoning.effort").String()),
+		ReasoningEffort:       optionalTrimmedStringPtr(gjson.GetBytes(body, "reasoning.effort").String()),
 		Stream:                clientStream,
 		UpstreamTerminalEvent: "response.completed",
-		ResponseHeaders:       resp.Header.Clone(),
-		Duration:              time.Since(startTime),
-		FirstTokenMs:          streamResult.FirstTokenMs,
+		ResponseHeaders:       compaction.ResponseHeaders,
+		Duration:              compaction.Duration,
+		FirstTokenMs:          compaction.FirstTokenMs,
+	}, nil
+}
+
+// forwardDeepSeekWSCompactionTurn keeps a websocket remote-compaction turn on
+// the HTTP bridge and emits exactly the two Responses events Codex expects.
+func (s *OpenAIGatewayService) forwardDeepSeekWSCompactionTurn(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	originalModel string,
+	turn int,
+	writeClientMessage func([]byte) error,
+) (*OpenAIForwardResult, error) {
+	billingModel := resolveOpenAIForwardModel(account, originalModel, "")
+	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	compaction, err := s.buildDeepSeekRemoteCompaction(
+		ctx, c, account, body, originalModel, billingModel, upstreamModel,
+	)
+	if err != nil {
+		var upstreamErr *deepSeekRemoteCompactionHTTPError
+		if errors.As(err, &upstreamErr) && upstreamErr != nil {
+			shouldFailover := s.shouldFailoverOpenAIUpstreamResponse(
+				account, upstreamErr.StatusCode, upstreamErr.Message, upstreamErr.Body,
+			)
+			if turn == 1 && shouldFailover {
+				return nil, newOpenAIUpstreamFailoverError(
+					upstreamErr.StatusCode, upstreamErr.Headers, upstreamErr.Body, upstreamErr.Message, false,
+				)
+			}
+			if shouldFailover || shouldCooldownOpenAITransientUpstreamError(upstreamErr.StatusCode, upstreamErr.Body) {
+				s.handleOpenAIAccountUpstreamError(
+					ctx, account, upstreamErr.StatusCode, upstreamErr.Headers, upstreamErr.Body, billingModel,
+				)
+			}
+			clientError := buildOpenAIWSHTTPBridgeErrorEvent(upstreamErr.StatusCode, upstreamErr.Message)
+			if writeErr := writeClientMessage(clientError); writeErr == nil {
+				markOpenAIWSClientVisibleFailure(c, "error", clientError)
+			}
+		}
+		return nil, err
+	}
+	if err := writeDeepSeekWSCompactionEvents(compaction.FinalJSON, writeClientMessage); err != nil {
+		return nil, fmt.Errorf("write DeepSeek websocket compaction events: %w", err)
+	}
+	return &OpenAIForwardResult{
+		RequestID:             compaction.ResponseID,
+		ResponseID:            compaction.ResponseID,
+		Usage:                 compaction.Usage,
+		Model:                 originalModel,
+		BillingModel:          billingModel,
+		UpstreamModel:         upstreamModel,
+		UpstreamResponseModel: observedUpstreamResponseModel(c),
+		UpstreamEndpoint:      deepSeekResponsesEndpoint,
+		ReasoningEffort:       optionalTrimmedStringPtr(gjson.GetBytes(body, "reasoning.effort").String()),
+		Stream:                true,
+		OpenAIWSMode:          true,
+		UpstreamTerminalEvent: "response.completed",
+		ResponseHeaders:       compaction.ResponseHeaders,
+		Duration:              compaction.Duration,
+		FirstTokenMs:          compaction.FirstTokenMs,
+		// The synthetic response id is not stored by DeepSeek. The next turn
+		// must replay this encrypted item instead of chaining against that id.
+		wsDeepSeekCompactionCheckpoint: append(json.RawMessage(nil), compaction.Compaction...),
 	}, nil
 }

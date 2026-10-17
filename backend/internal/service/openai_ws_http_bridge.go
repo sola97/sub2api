@@ -449,6 +449,23 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	if err != nil {
 		return nil, fmt.Errorf("prepare http bridge body: %w", err)
 	}
+	if isDeepSeekCompactBridgeModel(account, originalModel) {
+		if HasCompactionTriggerInInput(body) {
+			return s.forwardDeepSeekWSCompactionTurn(
+				ctx, c, account, body, originalModel, turn, writeClientMessage,
+			)
+		}
+		restoredBody, restored, restoreErr := s.RestoreDeepSeekCompactInput(ctx, body)
+		if restoreErr != nil {
+			return nil, fmt.Errorf("restore DeepSeek websocket compaction checkpoint: %w", restoreErr)
+		}
+		if restored {
+			body = restoredBody
+		}
+		if guardedBody, guarded := applyDeepSeekResponsesHistoryGuards(account, body, false); guarded {
+			body = guardedBody
+		}
+	}
 	grokIntentSourceBody := append([]byte(nil), body...)
 	_, grokExplicitToolsField := openAIWSHTTPBridgeRawField(grokIntentSourceBody, "tools")
 	grokExplicitToolIntent := account.Platform == PlatformGrok && hasGrokResponsesToolIntent(grokIntentSourceBody)

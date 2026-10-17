@@ -36,6 +36,7 @@ func openaiMappedDeepSeekResponsesAccount() *Account {
 			"api_key":  "sk-test",
 			"base_url": DefaultDeepseekBaseURL,
 			"model_mapping": map[string]any{
+				"gpt-5.5":     "deepseek-flash",
 				"gpt-5.6-sol": "deepseek-flash",
 			},
 		},
@@ -238,7 +239,7 @@ func TestForwardResponses_NativeDeepSeekInjectsReasoningPlaceholders(t *testing.
 
 func TestForwardOpenAIMappedDeepSeekRemoteCompactionSynthesizesOneItem(t *testing.T) {
 	body := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{
-		"model": "gpt-5.6-sol", "stream": true, "store": true,
+		"model": "gpt-5.5", "stream": true, "store": true,
 		"instructions": "You are Codex. Preserve the current engineering task.",
 		"reasoning":    map[string]any{"effort": "max", "summary": "detailed"},
 		"tools":        []any{map[string]any{"type": "function", "name": "shell", "description": "Run a command", "parameters": map[string]any{"type": "object"}}},
@@ -309,7 +310,7 @@ func TestForwardOfficialOpenAIRemoteCompactionDoesNotSynthesize(t *testing.T) {
 
 func TestForwardMappedDeepSeekRestoresOwnedCompactionAsUserCheckpoint(t *testing.T) {
 	compactBody := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{
-		"model": "gpt-5.6-sol", "stream": true,
+		"model": "gpt-5.5", "stream": true,
 		"input": []any{
 			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": strings.Repeat("history ", 40)}}},
 			map[string]any{"type": "compaction_trigger"},
@@ -326,7 +327,7 @@ func TestForwardMappedDeepSeekRestoresOwnedCompactionAsUserCheckpoint(t *testing
 	require.NotEmpty(t, envelope)
 
 	nextBody := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{
-		"model": "gpt-5.6-sol", "stream": false,
+		"model": "gpt-5.5", "stream": false,
 		"input": []any{
 			map[string]any{"type": "compaction", "encrypted_content": envelope},
 			map[string]any{"type": "message", "role": "user", "content": "continue"},
@@ -361,6 +362,50 @@ func TestForwardOpenAICompatMappedDeepSeekRemoteCompactionSynthesizesOneItem(t *
 	require.NoError(t, err)
 	require.Equal(t, "deepseek-flash", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.NotEqual(t, "compaction_trigger", gjson.GetBytes(upstream.lastBody, "input.1.type").String())
+
+	events := parseCompactBridgeSSE(t, recorder.Body.String())
+	require.Len(t, events, 2)
+	outputs := gjson.Get(events[1][1], "response.output").Array()
+	require.Len(t, outputs, 1)
+	require.Equal(t, "compaction", outputs[0].Get("type").String())
+	require.NotEmpty(t, outputs[0].Get("encrypted_content").String())
+}
+
+func TestDeepSeekCompactBridgeModelIsolation(t *testing.T) {
+	deepSeekAccount := openaiMappedDeepSeekResponsesAccount()
+	deepSeekAccount.Credentials["model_mapping"] = map[string]any{
+		"gpt-5.5":     "deepseek-flash",
+		"gpt-6.1-sol": "deepseek-flash",
+	}
+	require.True(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.5"))
+	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-6.1-sol"))
+	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.5-extra"))
+
+	wrongMapping := openaiMappedDeepSeekResponsesAccount()
+	wrongMapping.Credentials["model_mapping"] = map[string]any{
+		"gpt-5.5": "deepseek-v4-pro",
+	}
+	require.False(t, isDeepSeekCompactBridgeModel(wrongMapping, "gpt-5.5"))
+}
+
+func TestForwardOpenAIMappedDeepSeekCompactPathSynthesizesWithoutTrigger(t *testing.T) {
+	body := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{
+		"model":  "gpt-5.5",
+		"stream": true,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "Continue from the saved context."},
+		},
+	})
+	c, recorder := deepSeekResponsesTestContext(t, body)
+	c.Request.URL.Path = "/v1/responses/compact"
+	MarkOpenAICompactClientStream(c)
+
+	upstream := &httpUpstreamRecorder{resp: deepSeekRemoteCompactResponsesResponse(deepSeekRemoteCompactTestSummary)}
+	svc := &OpenAIGatewayService{cfg: deepSeekMappedResponsesTestConfig(), httpUpstream: upstream}
+
+	_, err := svc.Forward(deepSeekCompactTestContext(42), c, openaiMappedDeepSeekResponsesAccount(), body)
+	require.NoError(t, err)
+	require.Equal(t, deepSeekCompactInstruction, gjson.GetBytes(upstream.lastBody, "input.1.content.0.text").String())
 
 	events := parseCompactBridgeSSE(t, recorder.Body.String())
 	require.Len(t, events, 2)

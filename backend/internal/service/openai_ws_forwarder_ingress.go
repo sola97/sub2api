@@ -116,7 +116,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
 	forceHTTPBridge := account.Platform == PlatformGrok ||
-		(s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account))
+		(s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account)) ||
+		shouldForceDeepSeekCompactWSBridge(account, firstClientMessage)
 	modeRouterV2Enabled := s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled
 	ingressMode := OpenAIWSIngressModeCtxPool
 	if modeRouterV2Enabled && !forceHTTPBridge {
@@ -723,18 +724,29 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			// bridgeCurrentItems），保存历史必须经 combine 新建头，禁止就地 append。
 			bridgeReplayInput = turnReplayInput
 			bridgeReplayInputExists = turnReplayInputExists
-			if result.wsReplayInputExists {
-				bridgeReplayInput = combineOpenAIWSReplayItems(bridgeReplayInput, result.wsReplayInput)
-				bridgeReplayInputExists = true
-			}
 			bridgeAccountFailoverInput = turnAccountFailoverInput
 			bridgeAccountFailoverInputExists = turnAccountFailoverInputExists
-			if len(result.wsAccountFailoverReplayInput) > 0 {
-				bridgeAccountFailoverInput = combineOpenAIWSReplayItems(
-					bridgeAccountFailoverInput,
-					result.wsAccountFailoverReplayInput,
-				)
+			if len(result.wsDeepSeekCompactionCheckpoint) > 0 {
+				// The synthetic compaction response never exists on DeepSeek.
+				// Replace the pre-compaction history instead of chaining another
+				// request to its resp_* id.
+				bridgeReplayInput = []json.RawMessage{append(json.RawMessage(nil), result.wsDeepSeekCompactionCheckpoint...)}
 				bridgeAccountFailoverInputExists = true
+				bridgeReplayInputExists = true
+				bridgeAccountFailoverInput = []json.RawMessage{append(json.RawMessage(nil), result.wsDeepSeekCompactionCheckpoint...)}
+				bridgeAccountFailoverInputExists = true
+			} else {
+				if result.wsReplayInputExists {
+					bridgeReplayInput = combineOpenAIWSReplayItems(bridgeReplayInput, result.wsReplayInput)
+					bridgeReplayInputExists = true
+				}
+				if len(result.wsAccountFailoverReplayInput) > 0 {
+					bridgeAccountFailoverInput = combineOpenAIWSReplayItems(
+						bridgeAccountFailoverInput,
+						result.wsAccountFailoverReplayInput,
+					)
+					bridgeAccountFailoverInputExists = true
+				}
 			}
 			if bridgeTurnState := strings.TrimSpace(result.ResponseHeaders.Get(openAIWSTurnStateHeader)); bridgeTurnState != "" {
 				// Follow-up turns on this bridge retain their own upstream state;
@@ -1857,7 +1869,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// collector 增量经 combine 合并（新头数组）。
 		lastTurnReplayInput = currentTurnReplayInput
 		lastTurnReplayInputExists = currentTurnReplayInputExists
-		if result.wsReplayInputExists {
+		if len(result.wsDeepSeekCompactionCheckpoint) > 0 {
+			lastTurnReplayInput = []json.RawMessage{append(json.RawMessage(nil), result.wsDeepSeekCompactionCheckpoint...)}
+			lastTurnReplayInputExists = true
+		} else if result.wsReplayInputExists {
 			lastTurnReplayInput = combineOpenAIWSReplayItems(lastTurnReplayInput, result.wsReplayInput)
 			lastTurnReplayInputExists = true
 		}

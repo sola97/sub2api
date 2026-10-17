@@ -5,6 +5,12 @@ accounts that route GPT model names to DeepSeek. It applies to native DeepSeek
 accounts, direct `api.deepseek.com` accounts, and OpenAI-platform accounts whose
 configured model mapping targets `deepseek-*` through a compatible proxy.
 
+The bridge is opt-in per model. It currently handles `gpt-5.5` and
+`gpt-5.6-sol` only when the account maps that exact model name to
+`deepseek-flash`. Other GPT-5.6 variants, including `gpt-5.6`, `terra`, and
+`luna`, are not bridged. Keep them out of additional account allowlists if they
+must not be served from those sources.
+
 When a request ends with a final `compaction_trigger`, the gateway asks the
 upstream for a plain summary without tools, then returns exactly one
 `compaction` output item. The summary is authenticated-encrypted using the

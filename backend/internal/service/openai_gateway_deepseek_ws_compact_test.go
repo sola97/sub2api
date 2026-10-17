@@ -107,16 +107,22 @@ func TestDeepSeekWSNextTurnRestoresOwnedCheckpoint(t *testing.T) {
 	require.False(t, gjson.GetBytes(nextUpstream.lastBody, `input.#(type=="compaction")`).Exists())
 }
 
-func TestDeepSeekWSCompactionBridgeOnlyTouchesGPT55(t *testing.T) {
+func TestDeepSeekWSCompactionBridgeModelIsolation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	account := openaiMappedDeepSeekResponsesAccount()
 	account.Credentials["model_mapping"] = map[string]any{
 		"gpt-5.5":     "deepseek-flash",
+		"gpt-5.6-sol": "deepseek-flash",
 		"gpt-6.1-sol": "deepseek-flash",
 	}
 	require.True(t, shouldForceDeepSeekCompactWSBridge(account, []byte(`{"model":"gpt-5.5"}`)))
+	require.True(t, shouldForceDeepSeekCompactWSBridge(account, []byte(`{"model":"gpt-5.6-sol"}`)))
+	require.False(t, shouldForceDeepSeekCompactWSBridge(account, []byte(`{"model":"gpt-5.6"}`)))
+	require.False(t, shouldForceDeepSeekCompactWSBridge(account, []byte(`{"model":"gpt-5.6-terra"}`)))
+	require.False(t, shouldForceDeepSeekCompactWSBridge(account, []byte(`{"model":"gpt-5.6-luna"}`)))
 	require.False(t, shouldForceDeepSeekCompactWSBridge(account, []byte(`{"model":"gpt-6.1-sol"}`)))
+	require.False(t, shouldForceDeepSeekCompactWSBridge(account, []byte(`{"model":"gpt-5.6-sol-extra"}`)))
 }
 
 func TestDeepSeekWSCompactionEventsSurviveWebSocket(t *testing.T) {

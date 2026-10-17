@@ -93,13 +93,17 @@ func (e *deepSeekRemoteCompactionHTTPError) Error() string {
 	return fmt.Sprintf("DeepSeek compact upstream returned HTTP %d", e.StatusCode)
 }
 
-// isDeepSeekCompactBridgeModel limits the remote-compaction bridge to the
-// explicit gpt-5.5 -> deepseek-flash route. Other models on the same account,
-// including gpt-6.1-sol, keep their existing forwarding behavior.
+// isDeepSeekCompactBridgeModel limits the remote-compaction bridge to explicit
+// GPT -> deepseek-flash routes. Other models on the same account, including
+// gpt-6.1-sol, keep their existing forwarding behavior.
 func isDeepSeekCompactBridgeModel(account *Account, requestedModel string) bool {
 	requestedModel = strings.TrimSpace(requestedModel)
-	if account == nil || !isDeepSeekResponsesUpstream(account) ||
-		!strings.EqualFold(lastOpenAIModelSegment(requestedModel), "gpt-5.5") {
+	if account == nil || !isDeepSeekResponsesUpstream(account) {
+		return false
+	}
+	switch strings.ToLower(lastOpenAIModelSegment(requestedModel)) {
+	case "gpt-5.5", "gpt-5.6-sol":
+	default:
 		return false
 	}
 	mappedModel, matched := account.ResolveMappedModel(requestedModel)

@@ -375,17 +375,25 @@ func TestDeepSeekCompactBridgeModelIsolation(t *testing.T) {
 	deepSeekAccount := openaiMappedDeepSeekResponsesAccount()
 	deepSeekAccount.Credentials["model_mapping"] = map[string]any{
 		"gpt-5.5":     "deepseek-flash",
+		"gpt-5.6-sol": "deepseek-flash",
 		"gpt-6.1-sol": "deepseek-flash",
 	}
 	require.True(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.5"))
+	require.True(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.6-sol"))
+	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.6"))
+	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.6-terra"))
+	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.6-luna"))
 	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-6.1-sol"))
 	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.5-extra"))
+	require.False(t, isDeepSeekCompactBridgeModel(deepSeekAccount, "gpt-5.6-sol-extra"))
 
 	wrongMapping := openaiMappedDeepSeekResponsesAccount()
 	wrongMapping.Credentials["model_mapping"] = map[string]any{
-		"gpt-5.5": "deepseek-v4-pro",
+		"gpt-5.5":     "deepseek-v4-pro",
+		"gpt-5.6-sol": "deepseek-v4-pro",
 	}
 	require.False(t, isDeepSeekCompactBridgeModel(wrongMapping, "gpt-5.5"))
+	require.False(t, isDeepSeekCompactBridgeModel(wrongMapping, "gpt-5.6-sol"))
 }
 
 func TestForwardOpenAIMappedDeepSeekCompactPathSynthesizesWithoutTrigger(t *testing.T) {

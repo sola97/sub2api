@@ -33,7 +33,6 @@ const (
 	deepSeekCompactMaxEnvelopeBytes    = 256 * 1024
 	deepSeekCompactMaxSSEBytes         = 8 * 1024 * 1024
 	deepSeekCompactMaxSSELineBytes     = 1024 * 1024
-	deepSeekCompactSummaryMaxTokens    = 8192
 	deepSeekCompactEnvelopeVersion     = 1
 	deepSeekCompactMissingUsageMsg     = "DeepSeek compact upstream returned a successful response without billable usage"
 	deepSeekCompactInvalidStateMessage = "invalid DeepSeek compact encrypted_content"
@@ -370,7 +369,14 @@ func validateDeepSeekCompactToolPairs(items []json.RawMessage) error {
 	return nil
 }
 
-func deepSeekCompactResponsesRequest(body []byte, upstreamModel string) ([]byte, error) {
+func (s *OpenAIGatewayService) deepSeekCompactResponsesRequest(body []byte, upstreamModel string) ([]byte, error) {
+	maxOutputTokens := 0
+	if s != nil && s.cfg != nil {
+		maxOutputTokens = s.cfg.Gateway.OpenAICompactSummaryMaxTokens
+	}
+	if maxOutputTokens < 0 {
+		return nil, errors.New("DeepSeek remote compaction max_output_tokens must not be negative")
+	}
 	var source map[string]json.RawMessage
 	if err := json.Unmarshal(body, &source); err != nil {
 		return nil, fmt.Errorf("parse DeepSeek compact request: %w", err)
@@ -439,10 +445,14 @@ func deepSeekCompactResponsesRequest(body []byte, upstreamModel string) ([]byte,
 
 	modelRaw, _ := json.Marshal(upstreamModel)
 	request := map[string]json.RawMessage{
-		"model":             modelRaw,
-		"input":             upstreamInput,
-		"stream":            json.RawMessage("true"),
-		"max_output_tokens": json.RawMessage(strconv.Itoa(deepSeekCompactSummaryMaxTokens)),
+		"model":  modelRaw,
+		"input":  upstreamInput,
+		"stream": json.RawMessage("true"),
+	}
+	// 默认不限制输出长度：DeepSeek 的 reasoning 与摘要正文共享该额度，限制过小会让上游
+	// 返回 response.incomplete（reason=max_output_tokens），整次压缩直接失败。
+	if maxOutputTokens > 0 {
+		request["max_output_tokens"] = json.RawMessage(strconv.Itoa(maxOutputTokens))
 	}
 	if instructions, ok := source["instructions"]; ok {
 		request["instructions"] = instructions
@@ -827,7 +837,7 @@ func (s *OpenAIGatewayService) buildDeepSeekRemoteCompaction(
 	if _, err := s.deepSeekCompactAEAD(); err != nil {
 		return nil, err
 	}
-	responsesBody, err := deepSeekCompactResponsesRequest(body, upstreamModel)
+	responsesBody, err := s.deepSeekCompactResponsesRequest(body, upstreamModel)
 	if err != nil {
 		return nil, err
 	}

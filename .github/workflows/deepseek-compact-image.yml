@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - shenlp/deepseek-remote-compaction-v0.2.17
+      - shenlp/compact-max-tokens
     paths:
       - .github/workflows/deepseek-compact-image.yml
       - backend/go.mod

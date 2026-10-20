@@ -329,6 +329,10 @@ gateway:
   openai_compact_model: "gpt-5.5"
   # DeepSeek 远程压缩摘要的 max_output_tokens；0 表示不下发，交给上游默认上限。
   openai_compact_summary_max_tokens: 0
+  # Optional image-to-text route for DeepSeek remote compaction; disabled by default.
+  # Use an active OpenAI API-key account and a genuinely vision-capable Responses model.
+  deepseek_compact_vision_account_id: 0
+  deepseek_compact_vision_model: ""
   # ChatGPT Frameless Live 单会话硬上限（秒）。
   live:
     max_session_duration_seconds: 3600

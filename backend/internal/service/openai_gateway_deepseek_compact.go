@@ -51,8 +51,9 @@ Be concise, structured, and focused on helping the next LLM seamlessly continue 
 var ErrDeepSeekCompactInvalidEncryptedContent = errors.New(deepSeekCompactInvalidStateMessage)
 
 type deepSeekCompactEnvelope struct {
-	Version    int    `json:"version"`
-	Checkpoint string `json:"checkpoint"`
+	Version    int                    `json:"version"`
+	Checkpoint string                 `json:"checkpoint"`
+	Images     []deepSeekCompactImage `json:"images,omitempty"`
 }
 
 type deepSeekCompactStreamResult struct {
@@ -149,13 +150,23 @@ func (s *OpenAIGatewayService) deepSeekCompactAEAD() (cipher.AEAD, error) {
 }
 
 func (s *OpenAIGatewayService) sealDeepSeekCompactCheckpoint(ctx context.Context, checkpoint string) (string, error) {
+	return s.sealDeepSeekCompactState(ctx, deepSeekCompactEnvelope{Version: 1, Checkpoint: checkpoint})
+}
+
+func (s *OpenAIGatewayService) sealDeepSeekCompactState(ctx context.Context, state deepSeekCompactEnvelope) (string, error) {
+	checkpoint := state.Checkpoint
 	if !utf8.ValidString(checkpoint) || len(checkpoint) > deepSeekCompactMaxSummaryBytes {
 		return "", errors.New("DeepSeek compact checkpoint exceeds the supported size")
 	}
-	payload, err := marshalOpenAIUpstreamJSON(deepSeekCompactEnvelope{
-		Version:    deepSeekCompactEnvelopeVersion,
-		Checkpoint: checkpoint,
-	})
+	if len(state.Images) > 0 {
+		state.Version = 2
+	} else {
+		state.Version = 1
+	}
+	if err := validateDeepSeekCompactImages(state.Images); err != nil {
+		return "", err
+	}
+	payload, err := marshalOpenAIUpstreamJSON(state)
 	if err != nil {
 		return "", fmt.Errorf("encode DeepSeek compact checkpoint: %w", err)
 	}
@@ -180,7 +191,17 @@ func (s *OpenAIGatewayService) sealDeepSeekCompactCheckpoint(ctx context.Context
 }
 
 func (s *OpenAIGatewayService) openDeepSeekCompactCheckpoint(ctx context.Context, envelope string) (string, error) {
-	invalid := func() (string, error) { return "", ErrDeepSeekCompactInvalidEncryptedContent }
+	state, err := s.openDeepSeekCompactState(ctx, envelope)
+	if err != nil {
+		return "", err
+	}
+	return renderDeepSeekCompactState(state), nil
+}
+
+func (s *OpenAIGatewayService) openDeepSeekCompactState(ctx context.Context, envelope string) (deepSeekCompactEnvelope, error) {
+	invalid := func() (deepSeekCompactEnvelope, error) {
+		return deepSeekCompactEnvelope{}, ErrDeepSeekCompactInvalidEncryptedContent
+	}
 	if !strings.HasPrefix(envelope, deepSeekCompactEnvelopePrefix) || len(envelope) > deepSeekCompactMaxEnvelopeBytes {
 		return invalid()
 	}
@@ -203,13 +224,19 @@ func (s *OpenAIGatewayService) openDeepSeekCompactCheckpoint(ctx context.Context
 	}
 	var state deepSeekCompactEnvelope
 	if err := json.Unmarshal(payload, &state); err != nil ||
-		state.Version != deepSeekCompactEnvelopeVersion ||
+		(state.Version != 1 && state.Version != 2) ||
 		strings.TrimSpace(state.Checkpoint) == "" ||
 		len(state.Checkpoint) > deepSeekCompactMaxSummaryBytes ||
 		!utf8.ValidString(state.Checkpoint) {
 		return invalid()
 	}
-	return state.Checkpoint, nil
+	if (state.Version == 1 && len(state.Images) > 0) || (state.Version == 2 && len(state.Images) == 0) {
+		return invalid()
+	}
+	if err := validateDeepSeekCompactImages(state.Images); err != nil {
+		return invalid()
+	}
+	return state, nil
 }
 
 func (s *OpenAIGatewayService) deepSeekResponsesCompactUpstream(account *Account) (targetURL, token string, err error) {
@@ -837,7 +864,11 @@ func (s *OpenAIGatewayService) buildDeepSeekRemoteCompaction(
 	if _, err := s.deepSeekCompactAEAD(); err != nil {
 		return nil, err
 	}
-	responsesBody, err := s.deepSeekCompactResponsesRequest(body, upstreamModel)
+	textBody, images, err := s.prepareDeepSeekCompactImages(ctx, body, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
+	responsesBody, err := s.deepSeekCompactResponsesRequest(textBody, upstreamModel)
 	if err != nil {
 		return nil, err
 	}
@@ -867,7 +898,7 @@ func (s *OpenAIGatewayService) buildDeepSeekRemoteCompaction(
 		return nil, streamErr
 	}
 	checkpoint := frameDeepSeekCompactSummary(streamResult.Summary)
-	encryptedContent, err := s.sealDeepSeekCompactCheckpoint(ctx, checkpoint)
+	encryptedContent, err := s.sealDeepSeekCompactState(ctx, deepSeekCompactEnvelope{Checkpoint: checkpoint, Images: images})
 	if err != nil {
 		return nil, err
 	}

@@ -73,7 +73,7 @@ func TestResolveOpenAICompactFallbackModelPrefersAccountMapping(t *testing.T) {
 	require.Equal(t, "global-compact", svc.resolveOpenAICompactFallbackModel(account, "unmapped-model"))
 }
 
-func TestOpenAIGatewayForwardUsesGlobalCompactModelOnInitialLegacyRequest(t *testing.T) {
+func TestOpenAIGatewayForwardPreservesModelOnInitialLegacyRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"model":"gpt-5.5","stream":false,"instructions":"compact-test","input":[]}`)
 	c := newOpenAICompactFallbackTestContext(t, "/v1/responses/compact")
@@ -99,8 +99,46 @@ func TestOpenAIGatewayForwardUsesGlobalCompactModelOnInitialLegacyRequest(t *tes
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Len(t, upstream.bodies, 1)
-	require.Equal(t, "global-compact", gjson.GetBytes(upstream.bodies[0], "model").String())
+	require.Equal(t, "gpt-5.5", gjson.GetBytes(upstream.bodies[0], "model").String())
 	require.Contains(t, upstream.requests[0].URL.Path, "/compact")
+}
+
+func TestNativeCompactAPIKeyPreservesModelAndEncryptedCheckpoint(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		t.Run(strconv.FormatBool(passthrough), func(t *testing.T) {
+			body := []byte(`{"model":"gpt-6.1-sol","instructions":"compact","input":[{"type":"compaction","encrypted_content":"native-opaque-checkpoint"},{"role":"user","content":"continue"}]}`)
+			c := newOpenAICompactFallbackTestContext(t, "/v1/responses/compact")
+			c.Request.Header.Set("Content-Type", "application/json")
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"id":"compact","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`)),
+			}}
+			svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{Gateway: config.GatewayConfig{OpenAICompactModel: "gpt-5.5"}}}
+			account := &Account{ID: 4, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true,
+				Credentials: map[string]any{"api_key": "test", "model_mapping": map[string]any{"gpt-6.1-sol": "gpt-6.1-sol"}},
+				Extra:       map[string]any{"openai_passthrough": passthrough}}
+			_, err := svc.Forward(context.Background(), c, account, body)
+			require.NoError(t, err)
+			require.Len(t, upstream.bodies, 1)
+			require.Equal(t, "gpt-6.1-sol", gjson.GetBytes(upstream.lastBody, "model").String())
+			require.Equal(t, "native-opaque-checkpoint", gjson.GetBytes(upstream.lastBody, "input.0.encrypted_content").String())
+		})
+	}
+}
+
+func TestCompactFallbackDoesNotSwitchEncryptedCheckpointModel(t *testing.T) {
+	for _, kind := range []string{"compaction", "compaction_summary"} {
+		t.Run(kind, func(t *testing.T) {
+			svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{OpenAICompactModel: "gpt-5.5"}}}
+			c := newOpenAICompactFallbackTestContext(t, "/v1/responses/compact")
+			body := []byte(`{"model":"gpt-6.1-sol","input":[{"type":"` + kind + `","encrypted_content":"opaque-native-checkpoint"}]}`)
+			errorBody := []byte(`{"error":{"code":"model_not_found","message":"model not found"}}`)
+			got, model, retry := svc.prepareOpenAICompactFallbackRetry(c, nil, "gpt-6.1-sol", body, http.StatusNotFound, "model not found", errorBody, false)
+			require.False(t, retry)
+			require.Empty(t, model)
+			require.Equal(t, body, got)
+		})
+	}
 }
 
 func TestPrepareOpenAICompactFallbackRetryLegacyPathAndSingleAttemptGuard(t *testing.T) {

@@ -19,6 +19,9 @@ on:
       - backend/internal/service/openai_gateway_deepseek_ws_compact_test.go
       - backend/internal/service/openai_gateway_deepseek_responses_history.go
       - backend/internal/service/openai_gateway_forward.go
+      - backend/internal/service/openai_gateway_passthrough.go
+      - backend/internal/service/openai_compact_fallback.go
+      - backend/internal/service/openai_compact_fallback_test.go
       - backend/internal/service/openai_gateway_service.go
       - backend/internal/service/openai_ws_forwarder_ingress.go
       - backend/internal/service/openai_ws_http_bridge.go
@@ -48,6 +51,7 @@ jobs:
         working-directory: backend
         run: |
           go test ./internal/config/ -run 'DeepSeekCompactVision' -count=1
+          go test -race ./internal/service/ -run 'Test.*(Compact|Compaction|GPT55Retirement)' -count=1
           go test -race ./internal/service/ -run 'TestEnsureDeepSeekResponsesReasoningPlaceholders|TestForwardResponses_MappedDeepSeek|TestForwardResponses_OfficialOpenAIStillStripsReasoningContent|TestForwardResponses_NativeDeepSeekInjectsReasoningPlaceholders|TestForwardOpenAIMappedDeepSeekRemoteCompactionSynthesizesOneItem|TestForwardOfficialOpenAIRemoteCompactionDoesNotSynthesize|TestForwardMappedDeepSeekRestoresOwnedCompactionAsUserCheckpoint|TestForwardOpenAICompatMappedDeepSeekRemoteCompactionSynthesizesOneItem|TestDeepSeekCompact|TestDeepSeekWS|TestEnsureDeepSeekChatReasoningPlaceholders|TestForwardResponses_DeepSeekChatFallback' -count=1
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3

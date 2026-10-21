@@ -30,8 +30,10 @@ that select GPT-5.5. OpenAI recommends GPT-6.1 Sol for eligible paid plans or
 GPT-6 Luna for Free/Go in the desktop app, subject to model availability. Check
 availability on the upstream account before selecting a replacement.
 
-The global `gateway.openai_compact_model` setting remains compatible with API-key
-upstreams. If that fallback resolves to retired GPT-5.5 on a ChatGPT account, it
+The global `gateway.openai_compact_model` setting is used only after recognized
+compact model/context errors, never to replace the model on the initial request.
+Automatic cross-model retry is disabled when input contains an encrypted compact
+checkpoint. If the fallback resolves to retired GPT-5.5 on a ChatGPT account, it
 is not applied; compact requests keep their selected model. A compact-only
 account mapping targeting retired GPT-5.5 is ineligible for scheduling: update
 that explicit mapping. No stored settings are automatically rewritten.

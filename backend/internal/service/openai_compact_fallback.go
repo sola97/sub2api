@@ -49,10 +49,10 @@ func isExplicitOpenAICompactRequest(c *gin.Context, body []byte) bool {
 	return isOpenAIResponsesCompactPath(c) || HasCompactionTriggerInInput(body)
 }
 
-// resolveOpenAICompactFallbackModel prefers the account's compact-only rule
-// for the client-visible model. The process-wide fallback is used only when
-// that account has no matching compact rule.
-func (s *OpenAIGatewayService) resolveOpenAICompactFallbackModel(account *Account, requestedModel string) string {
+// Initial requests honor explicit account rules, never the process-wide error
+// fallback. An eager global override can send native GPT checkpoints to an
+// unrelated provider behind an API-key proxy.
+func (s *OpenAIGatewayService) resolveOpenAIInitialCompactModel(account *Account, requestedModel string) string {
 	requestedModel = strings.TrimSpace(requestedModel)
 	if account != nil {
 		if mapped, matched := account.ResolveCompactMappedModel(requestedModel); matched {
@@ -62,6 +62,21 @@ func (s *OpenAIGatewayService) resolveOpenAICompactFallbackModel(account *Accoun
 				}
 				return mapped
 			}
+		}
+	}
+	return ""
+}
+
+// resolveOpenAICompactFallbackModel is used only after a recognized compact
+// model/context error. Account rules still take precedence over the global rule.
+func (s *OpenAIGatewayService) resolveOpenAICompactFallbackModel(account *Account, requestedModel string) string {
+	if mapped := s.resolveOpenAIInitialCompactModel(account, requestedModel); mapped != "" {
+		return mapped
+	}
+	// A matching retired account rule must not fall through to a global rule.
+	if account != nil {
+		if _, matched := account.ResolveCompactMappedModel(strings.TrimSpace(requestedModel)); matched {
+			return ""
 		}
 	}
 	if s == nil || s.cfg == nil {
@@ -260,6 +275,14 @@ func (s *OpenAIGatewayService) prepareOpenAICompactFallbackRetry(
 	currentModel := strings.TrimSpace(gjson.GetBytes(currentBody, "model").String())
 	if fallbackModel == "" || strings.EqualFold(fallbackModel, currentModel) {
 		return currentBody, "", false
+	}
+	for _, item := range gjson.GetBytes(currentBody, "input").Array() {
+		kind := item.Get("type").String()
+		if (kind == "compaction" || kind == "compaction_summary") && strings.TrimSpace(item.Get("encrypted_content").String()) != "" {
+			// Opaque checkpoints are not portable across model/provider boundaries.
+			// Keep the original error and context rather than retrying or dropping it.
+			return currentBody, "", false
+		}
 	}
 	retryBody := ReplaceModelInBody(currentBody, fallbackModel)
 	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(retryBody, "model").String()), currentModel) {

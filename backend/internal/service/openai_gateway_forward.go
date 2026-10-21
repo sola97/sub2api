@@ -401,7 +401,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	requestedModel := reqModel
 	billingModel, upstreamModel := resolveOpenAIForwardMappedModels(account, requestedModel, isCompactRequest)
 	if isCompactRequest {
-		if compactModel := s.resolveOpenAICompactFallbackModel(account, requestedModel); compactModel != "" {
+		if compactModel := s.resolveOpenAIInitialCompactModel(account, requestedModel); compactModel != "" {
 			upstreamModel = compactModel
 		}
 	}

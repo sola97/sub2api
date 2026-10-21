@@ -1039,8 +1039,8 @@ type GatewayConfig struct {
 	// OpenAIPassthroughAllowTimeoutHeaders: OpenAI 透传模式是否放行客户端超时头
 	// 关闭（默认）可避免 x-stainless-timeout 等头导致上游提前断流。
 	OpenAIPassthroughAllowTimeoutHeaders bool `mapstructure:"openai_passthrough_allow_timeout_headers"`
-	// OpenAICompactModel: /responses/compact 上游使用的模型。
-	// compact 端点支持模型滞后于普通 /responses 时，可用该配置降级规避上游错误。
+	// OpenAICompactModel: 显式压缩遇到模型不可用或上下文错误后的备用模型。
+	// 首次请求保持原模型（除非配置账号专用映射）；已有加密压缩内容时禁止跨模型重试。
 	OpenAICompactModel string `mapstructure:"openai_compact_model"`
 	// OpenAICompactSummaryMaxTokens: DeepSeek 远程压缩摘要请求下发的 max_output_tokens。
 	// 0（默认）表示不写该字段，由上游使用自身默认上限；正值表示显式限制摘要输出长度。

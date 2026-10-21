@@ -145,7 +145,10 @@ func (s *OpenAIGatewayService) prepareDeepSeekCompactImages(ctx context.Context,
 		}
 		encrypted, _ := item["encrypted_content"].(string)
 		if !strings.HasPrefix(encrypted, deepSeekCompactEnvelopePrefix) {
-			return nil, nil, ErrDeepSeekCompactInvalidEncryptedContent
+			// Another gateway or provider owns this checkpoint. Its plaintext history
+			// is still available in this request, so rebuild the summary without the
+			// opaque foreign item.
+			continue
 		}
 		state, err := s.openDeepSeekCompactState(ctx, encrypted)
 		if err != nil {
@@ -228,6 +231,9 @@ func (s *OpenAIGatewayService) prepareDeepSeekCompactImages(ctx context.Context,
 		}
 		if item["type"] == "compaction" || item["type"] == "compaction_summary" {
 			encrypted, _ := item["encrypted_content"].(string)
+			if !strings.HasPrefix(encrypted, deepSeekCompactEnvelopePrefix) {
+				continue
+			}
 			state, err := s.openDeepSeekCompactState(ctx, encrypted)
 			if err != nil {
 				return nil, nil, err

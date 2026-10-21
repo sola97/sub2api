@@ -127,6 +127,44 @@ func TestDeepSeekCompactImagesRejectBeforeBillableCalls(t *testing.T) {
 	require.Empty(t, upstream.requests)
 }
 
+func TestDeepSeekCompactImagesDropsForeignCompaction(t *testing.T) {
+	svc, upstream := compactImagesService()
+	upstream.resp = compactVisionResponse("completed", `[{"type":"output_text","text":"Screenshot description."}]`)
+	body := []byte(`{"model":"gpt-5.6-sol","input":[` +
+		`{"type":"compaction","encrypted_content":"foreign-provider-checkpoint"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"visible history"},{"type":"input_image","image_url":"` + compactTestImageURL + `"}]},` +
+		`{"type":"compaction_trigger"}]}`)
+
+	textBody, images, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), body, "deepseek-flash")
+	require.NoError(t, err)
+	require.Len(t, images, 1)
+	require.NotContains(t, string(textBody), "foreign-provider-checkpoint")
+	require.Contains(t, string(textBody), "visible history")
+	require.Len(t, upstream.requests, 1)
+	require.NotContains(t, string(upstream.bodies[0]), "foreign-provider-checkpoint")
+}
+
+func TestDeepSeekCompactImagesForeignCompactionNeedsVisibleHistory(t *testing.T) {
+	svc, upstream := compactImagesService()
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"compaction","encrypted_content":"foreign-provider-checkpoint"},{"type":"compaction_trigger"}]}`)
+
+	_, _, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), body, "deepseek-flash")
+	require.ErrorContains(t, err, "no conversation history")
+	require.Empty(t, upstream.requests)
+}
+
+func TestDeepSeekCompactImagesOwnedCompactionStillRequiresDecryption(t *testing.T) {
+	svc, upstream := compactImagesService()
+	body := []byte(`{"model":"gpt-5.6-sol","input":[` +
+		`{"type":"compaction","encrypted_content":"` + deepSeekCompactEnvelopePrefix + `invalid"},` +
+		`{"type":"message","role":"user","content":"visible history"},` +
+		`{"type":"compaction_trigger"}]}`)
+
+	_, _, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), body, "deepseek-flash")
+	require.ErrorIs(t, err, ErrDeepSeekCompactInvalidEncryptedContent)
+	require.Empty(t, upstream.requests)
+}
+
 func TestDeepSeekCompactImagesVisionFailures(t *testing.T) {
 	for name, response := range map[string]*http.Response{
 		"incomplete": compactVisionResponse("incomplete", `[{"type":"output_text","text":"partial"}]`),

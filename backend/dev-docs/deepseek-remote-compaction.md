@@ -45,20 +45,23 @@ API-key account whose Responses model can actually interpret images. The route
 must not map back to DeepSeek. No account or model is inferred from the client.
 
 The gateway describes each distinct image using this account, then sends a
-text-only history copy to DeepSeek. It preserves original image parts and
-descriptions in the authenticated encrypted capsule. Continuation restores a
-deterministic image-description appendix even if the summary omitted the image.
-Subsequent compaction carries the image records forward without interpreting
-the same image again. Source requests and image URLs are not overwritten.
+text-only history copy to DeepSeek. The authenticated encrypted capsule keeps
+the stable image ID and its description, but not the original image payload or
+URL. Continuation restores a deterministic image-description appendix even if
+the summary omitted the image. Subsequent compaction carries the image records
+forward without interpreting the same image again. Source requests and image
+URLs are not overwritten, and a stored description cannot fetch or replay the
+original image.
 
 This does not add a client image retrieval API or an agent tool. Remote image
 URLs retain their original lifetime; the gateway does not make them permanent.
 Images are not silently discarded when unsupported, unreadable or oversized.
 Only eight distinct images are accepted per checkpoint. Descriptions are bounded
-to 8 KiB each. The existing 256 KiB encoded capsule limit remains in force. Assets
-which cannot fit even in a minimal checkpoint fail before model calls; the actual
-summary and descriptions are checked again before issuing the capsule.
-Large inline screenshots may therefore require a durable URL or a smaller image.
+to 8 KiB each, and an individual image source is limited to 32 MiB. The existing
+256 KiB encoded capsule limit remains in force. Assets which cannot fit even in a
+minimal checkpoint fail before model calls; the actual summary and descriptions
+are checked again before issuing the capsule. Large inline screenshots are
+described normally because their bytes are not persisted in the capsule.
 File-ID-only inputs and unsupported image-generation records fail explicitly.
 
 Vision requests have a 60-second timeout, a bounded response body and no automatic
@@ -68,9 +71,11 @@ vision route can consume upstream quota. Auxiliary vision usage is not added to
 DeepSeek tokens or billed as DeepSeek usage; separate end-user billing for this
 auxiliary operation is not implemented by this change.
 
-Text capsules remain payload version 1. Image capsules use payload version 2,
-under the existing outer prefix and user-bound cipher domain. New code reads
-both. Old code rejects image capsules, so rolling back the binary does not allow
-those sessions to continue until upgraded again. Keep `JWT_SECRET` unchanged.
+Text capsules remain payload version 1. New image capsules use payload version 3,
+which stores bounded references. Version 2 capsules from the previous release
+remain readable and continue through the legacy original-image path until they
+are replaced. Old code rejects version 3 capsules, so rolling back the binary
+does not allow newly compacted image sessions to continue until upgraded again.
+Keep `JWT_SECRET` unchanged.
 
 Deployment is deferred while the current user session depends on this gateway.

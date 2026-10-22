@@ -159,11 +159,14 @@ func (s *OpenAIGatewayService) sealDeepSeekCompactState(ctx context.Context, sta
 		return "", errors.New("DeepSeek compact checkpoint exceeds the supported size")
 	}
 	if len(state.Images) > 0 {
-		state.Version = 2
+		state.Version = deepSeekCompactImageVersion
+		for i := range state.Images {
+			state.Images[i] = boundedDeepSeekCompactImage(state.Images[i])
+		}
 	} else {
 		state.Version = 1
 	}
-	if err := validateDeepSeekCompactImages(state.Images); err != nil {
+	if err := validateDeepSeekCompactImages(state.Version, state.Images); err != nil {
 		return "", err
 	}
 	payload, err := marshalOpenAIUpstreamJSON(state)
@@ -224,16 +227,16 @@ func (s *OpenAIGatewayService) openDeepSeekCompactState(ctx context.Context, env
 	}
 	var state deepSeekCompactEnvelope
 	if err := json.Unmarshal(payload, &state); err != nil ||
-		(state.Version != 1 && state.Version != 2) ||
+		(state.Version != 1 && state.Version != 2 && state.Version != deepSeekCompactImageVersion) ||
 		strings.TrimSpace(state.Checkpoint) == "" ||
 		len(state.Checkpoint) > deepSeekCompactMaxSummaryBytes ||
 		!utf8.ValidString(state.Checkpoint) {
 		return invalid()
 	}
-	if (state.Version == 1 && len(state.Images) > 0) || (state.Version == 2 && len(state.Images) == 0) {
+	if (state.Version == 1 && len(state.Images) > 0) || (state.Version != 1 && len(state.Images) == 0) {
 		return invalid()
 	}
-	if err := validateDeepSeekCompactImages(state.Images); err != nil {
+	if err := validateDeepSeekCompactImages(state.Version, state.Images); err != nil {
 		return invalid()
 	}
 	return state, nil

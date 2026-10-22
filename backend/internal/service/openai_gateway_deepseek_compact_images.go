@@ -19,10 +19,12 @@ import (
 
 const compactImageMaxCount = 8
 const compactImageDescriptionLimit = 8192
+const compactImageMaxSourceBytes = 32 * 1024 * 1024
+const deepSeekCompactImageVersion = 3
 
 type deepSeekCompactImage struct {
 	ID          string          `json:"id"`
-	Original    json.RawMessage `json:"original"`
+	Original    json.RawMessage `json:"original,omitempty"`
 	Description string          `json:"description"`
 }
 
@@ -59,8 +61,8 @@ func compactImagePart(part map[string]any) (map[string]any, bool, error) {
 	if source == "" {
 		return nil, true, compactImageError("image requires an accessible image_url; file_id-only and generated-image items are unsupported")
 	}
-	if len(source) > deepSeekCompactMaxEnvelopeBytes {
-		return nil, true, compactImageError("image exceeds the encrypted checkpoint size budget")
+	if len(source) > compactImageMaxSourceBytes {
+		return nil, true, compactImageError("image source exceeds the supported request size")
 	}
 	parsed, err := url.Parse(source)
 	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http" && parsed.Scheme != "data") || (parsed.Scheme != "data" && parsed.Host == "") {
@@ -82,25 +84,62 @@ func compactImagePart(part map[string]any) (map[string]any, bool, error) {
 	return image, true, nil
 }
 
+func compactImageDigest(source string) string {
+	digest := sha256.Sum256([]byte(source))
+	return "img_" + hex.EncodeToString(digest[:])
+}
+
 func compactImageID(original json.RawMessage) string {
+	var part map[string]any
+	if json.Unmarshal(original, &part) != nil {
+		return ""
+	}
+	normalized, isImage, err := compactImagePart(part)
+	if !isImage || err != nil {
+		return ""
+	}
+	source, _ := normalized["image_url"].(string)
+	return compactImageDigest(source)
+}
+
+func legacyCompactImageID(original json.RawMessage) string {
 	digest := sha256.Sum256(original)
 	return "img_" + hex.EncodeToString(digest[:])
 }
 
-func validateDeepSeekCompactImages(images []deepSeekCompactImage) error {
+// Persist only a bounded reference. The image itself is needed only while the
+// vision model produces a description; the encrypted capsule is much smaller.
+func boundedDeepSeekCompactImage(image deepSeekCompactImage) deepSeekCompactImage {
+	image.Original = nil
+	return image
+}
+
+func validateDeepSeekCompactImages(version int, images []deepSeekCompactImage) error {
 	if len(images) > compactImageMaxCount {
 		return compactImageError("too many images (maximum 8)")
 	}
 	seen := map[string]bool{}
 	for _, image := range images {
-		if image.ID != compactImageID(image.Original) || seen[image.ID] || strings.TrimSpace(image.Description) == "" || !utf8.ValidString(image.Description) || len(image.Description) > compactImageDescriptionLimit {
+		if !strings.HasPrefix(image.ID, "img_") || len(image.ID) != len("img_")+sha256.Size*2 || seen[image.ID] || strings.TrimSpace(image.Description) == "" || !utf8.ValidString(image.Description) || len(image.Description) > compactImageDescriptionLimit {
 			return compactImageError("invalid image record")
 		}
-		var part map[string]any
-		if json.Unmarshal(image.Original, &part) != nil {
-			return compactImageError("invalid original image")
+		if len(image.Original) > 0 {
+			var part map[string]any
+			expectedID := compactImageID(image.Original)
+			if version < deepSeekCompactImageVersion {
+				expectedID = legacyCompactImageID(image.Original)
+			}
+			if json.Unmarshal(image.Original, &part) != nil || image.ID != expectedID {
+				return compactImageError("invalid original image")
+			}
+			if _, isImage, err := compactImagePart(part); !isImage || err != nil {
+				return compactImageError("invalid original image")
+			}
 		}
-		if _, isImage, err := compactImagePart(part); !isImage || err != nil {
+		if version >= deepSeekCompactImageVersion && len(image.Original) != 0 {
+			return compactImageError("invalid bounded image record")
+		}
+		if version < deepSeekCompactImageVersion && len(image.Original) == 0 {
 			return compactImageError("invalid original image")
 		}
 		seen[image.ID] = true
@@ -155,6 +194,14 @@ func (s *OpenAIGatewayService) prepareDeepSeekCompactImages(ctx context.Context,
 			return nil, nil, err
 		}
 		for _, image := range state.Images {
+			// Version 2 hashed the full image part. Normalize its stable ID to
+			// the source digest so the same visible image does not become a
+			// second asset during the first version 3 compaction.
+			if len(image.Original) > 0 {
+				if id := compactImageID(image.Original); id != "" {
+					image.ID = id
+				}
+			}
 			if _, ok := byID[image.ID]; !ok {
 				byID[image.ID] = len(images)
 				images = append(images, image)
@@ -284,7 +331,7 @@ func (s *OpenAIGatewayService) prepareDeepSeekCompactImages(ctx context.Context,
 	}
 	if len(images) > 0 {
 		// Deterministic descriptions also reach the summary model; never rely on an
-		// opaque ID alone. Original URLs stay exclusively in the encrypted asset list.
+		// opaque ID alone.
 		var finalItems []json.RawMessage
 		if err := json.Unmarshal(request["input"], &finalItems); err != nil {
 			return nil, nil, err
@@ -318,7 +365,11 @@ func compactImagesFitMinimumCheckpoint(images []deepSeekCompactImage) error {
 	if len(images) == 0 {
 		return nil
 	}
-	payload, err := marshalOpenAIUpstreamJSON(deepSeekCompactEnvelope{Version: 2, Checkpoint: frameDeepSeekCompactSummary("x"), Images: images})
+	bounded := make([]deepSeekCompactImage, len(images))
+	for i := range images {
+		bounded[i] = boundedDeepSeekCompactImage(images[i])
+	}
+	payload, err := marshalOpenAIUpstreamJSON(deepSeekCompactEnvelope{Version: deepSeekCompactImageVersion, Checkpoint: frameDeepSeekCompactSummary("x"), Images: bounded})
 	if err != nil {
 		return err
 	}

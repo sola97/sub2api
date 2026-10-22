@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -51,9 +52,10 @@ func TestDeepSeekCompactImagesRoundTripAndSecondCompaction(t *testing.T) {
 	require.NoError(t, err)
 	state, err := svc.openDeepSeekCompactState(deepSeekCompactTestContext(42), encrypted)
 	require.NoError(t, err)
-	require.Equal(t, 2, state.Version)
-	require.JSONEq(t, string(images[0].Original), string(state.Images[0].Original))
-	require.Equal(t, compactTestImageURL, gjson.GetBytes(state.Images[0].Original, "image_url").String())
+	require.Equal(t, deepSeekCompactImageVersion, state.Version)
+	require.Empty(t, state.Images[0].Original)
+	require.Equal(t, images[0].ID, state.Images[0].ID)
+	require.Equal(t, images[0].Description, state.Images[0].Description)
 	_, err = svc.openDeepSeekCompactState(deepSeekCompactTestContext(43), encrypted)
 	require.ErrorIs(t, err, ErrDeepSeekCompactInvalidEncryptedContent)
 	replay := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{"model": "gpt-5.6-sol", "input": []any{map[string]any{"type": "compaction", "encrypted_content": encrypted}, map[string]any{"type": "message", "role": "user", "content": "continue"}}})
@@ -69,7 +71,9 @@ func TestDeepSeekCompactImagesRoundTripAndSecondCompaction(t *testing.T) {
 	require.NoError(t, err)
 	_, nextImages, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), second, "deepseek-flash")
 	require.NoError(t, err)
-	require.Equal(t, images, nextImages)
+	require.Len(t, nextImages, 1)
+	require.Equal(t, images[0].ID, nextImages[0].ID)
+	require.Equal(t, images[0].Description, nextImages[0].Description)
 	require.Len(t, upstream.requests, 1, "old images must not be described again")
 	legacy, err := svc.sealDeepSeekCompactCheckpoint(deepSeekCompactTestContext(42), "old text checkpoint")
 	require.NoError(t, err)
@@ -111,7 +115,6 @@ func TestDeepSeekCompactImagesRejectBeforeBillableCalls(t *testing.T) {
 	for name, part := range map[string]string{
 		"file_only": `{"type":"input_image","file_id":"file-test"}`,
 		"bad_data":  `{"type":"input_image","image_url":"data:image/png;base64,invalid!"}`,
-		"oversize":  `{"type":"input_image","image_url":"https://example.test/` + strings.Repeat("a", 200000) + `"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc, upstream := compactImagesService()
@@ -120,11 +123,130 @@ func TestDeepSeekCompactImagesRejectBeforeBillableCalls(t *testing.T) {
 			require.Empty(t, upstream.requests)
 		})
 	}
+	t.Run("source_limit", func(t *testing.T) {
+		svc, upstream := compactImagesService()
+		part := `{"type":"input_image","image_url":"https://example.test/` + strings.Repeat("a", compactImageMaxSourceBytes) + `"}`
+		_, _, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), compactImageHistory(part), "deepseek-flash")
+		require.ErrorContains(t, err, "image source exceeds")
+		require.Empty(t, upstream.requests)
+	})
 	svc, upstream := compactImagesService()
 	body := []byte(strings.Replace(string(compactImageHistory(`{"type":"input_image","image_url":"`+compactTestImageURL+`"}`)), `"compaction_trigger"`, `"function_call","call_id":"missing","name":"tool"`, 1))
 	_, _, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), body, "deepseek-flash")
 	require.Error(t, err)
 	require.Empty(t, upstream.requests)
+}
+
+func TestDeepSeekCompactImageVersion2CapsuleRemainsReadable(t *testing.T) {
+	svc, _ := compactImagesService()
+	original := json.RawMessage(`{"type":"input_image","image_url":"` + compactTestImageURL + `"}`)
+	legacyImages := []deepSeekCompactImage{{
+		ID:          legacyCompactImageID(original),
+		Original:    original,
+		Description: "Legacy screenshot description.",
+	}}
+	state := deepSeekCompactEnvelope{Version: 2, Checkpoint: "legacy image checkpoint", Images: legacyImages}
+	payload, err := marshalOpenAIUpstreamJSON(state)
+	require.NoError(t, err)
+	aead, err := svc.deepSeekCompactAEAD()
+	require.NoError(t, err)
+	nonce := make([]byte, aead.NonceSize())
+	aad, err := deepSeekCompactUserAAD(deepSeekCompactTestContext(42))
+	require.NoError(t, err)
+	sealed := aead.Seal(nonce, nonce, payload, aad)
+	envelope := deepSeekCompactEnvelopePrefix + base64.RawURLEncoding.EncodeToString(sealed)
+
+	opened, err := svc.openDeepSeekCompactState(deepSeekCompactTestContext(42), envelope)
+	require.NoError(t, err)
+	require.Equal(t, 2, opened.Version)
+	require.Equal(t, legacyImages, opened.Images)
+	require.Contains(t, renderDeepSeekCompactState(opened), "Legacy screenshot description.")
+}
+
+func TestDeepSeekCompactImagesLargeInlineScreenshotUsesBoundedReference(t *testing.T) {
+	svc, upstream := compactImagesService()
+	upstream.resp = compactVisionResponse("completed", `[{"type":"output_text","text":"Large screenshot with a settings dialog."}]`)
+	imageData := strings.Repeat("A", 400*1024)
+	source := "https://images.example/screenshot.png?" + imageData
+	body := compactImageHistory(`{"type":"input_image","image_url":"` + source + `","detail":"high"}`)
+
+	textBody, images, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), body, "deepseek-flash")
+	require.NoError(t, err)
+	require.NotContains(t, string(textBody), imageData)
+	require.Len(t, images, 1)
+	require.NotEmpty(t, images[0].Original)
+	require.Len(t, upstream.requests, 1)
+
+	encrypted, err := svc.sealDeepSeekCompactState(deepSeekCompactTestContext(42), deepSeekCompactEnvelope{Checkpoint: "summary", Images: images})
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(encrypted), deepSeekCompactMaxEnvelopeBytes)
+	state, err := svc.openDeepSeekCompactState(deepSeekCompactTestContext(42), encrypted)
+	require.NoError(t, err)
+	require.Equal(t, deepSeekCompactImageVersion, state.Version)
+	require.Len(t, state.Images, 1)
+	require.Empty(t, state.Images[0].Original)
+	require.Equal(t, images[0].ID, state.Images[0].ID)
+	require.Equal(t, images[0].Description, state.Images[0].Description)
+
+	second := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{"model": "gpt-5.6-sol", "input": []any{map[string]any{"type": "compaction", "encrypted_content": encrypted}, map[string]any{"type": "compaction_trigger"}}})
+	_, reused, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), second, "deepseek-flash")
+	require.NoError(t, err)
+	require.Equal(t, state.Images, reused)
+	require.Len(t, upstream.requests, 1, "persisted descriptions must be reused")
+}
+
+func TestDeepSeekCompactImageVersion2CapsuleDoesNotDuplicateVisibleImage(t *testing.T) {
+	svc, upstream := compactImagesService()
+	original := json.RawMessage(`{"type":"input_image","image_url":"` + compactTestImageURL + `","detail":"high"}`)
+	legacyImages := []deepSeekCompactImage{{
+		ID:          legacyCompactImageID(original),
+		Original:    original,
+		Description: "Legacy screenshot description.",
+	}}
+	state := deepSeekCompactEnvelope{Version: 2, Checkpoint: "legacy image checkpoint", Images: legacyImages}
+	payload, err := marshalOpenAIUpstreamJSON(state)
+	require.NoError(t, err)
+	aead, err := svc.deepSeekCompactAEAD()
+	require.NoError(t, err)
+	nonce := make([]byte, aead.NonceSize())
+	aad, err := deepSeekCompactUserAAD(deepSeekCompactTestContext(42))
+	require.NoError(t, err)
+	sealed := aead.Seal(nonce, nonce, payload, aad)
+	envelope := deepSeekCompactEnvelopePrefix + base64.RawURLEncoding.EncodeToString(sealed)
+
+	body := mustMarshalDeepSeekCompactTestJSON(t, map[string]any{"model": "gpt-5.6-sol", "input": []any{
+		map[string]any{"type": "compaction", "encrypted_content": envelope},
+		map[string]any{"type": "message", "role": "user", "content": []any{
+			map[string]any{"type": "input_image", "image_url": compactTestImageURL, "detail": "high"},
+		}},
+		map[string]any{"type": "compaction_trigger"},
+	}})
+	_, images, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), body, "deepseek-flash")
+	require.NoError(t, err)
+	require.Len(t, images, 1)
+	require.Equal(t, "Legacy screenshot description.", images[0].Description)
+	require.Empty(t, upstream.requests)
+}
+
+func TestDeepSeekCompactImagesLargeInlineBase64UsesBoundedReference(t *testing.T) {
+	svc, upstream := compactImagesService()
+	upstream.resp = compactVisionResponse("completed", `[{"type":"output_text","text":"Large inline screenshot."}]`)
+	imageData := strings.Repeat("A", 400*1024)
+	source := "data:image/png;base64," + imageData
+	body := compactImageHistory(`{"type":"input_image","image_url":"` + source + `"}`)
+
+	textBody, images, err := svc.prepareDeepSeekCompactImages(deepSeekCompactTestContext(42), body, "deepseek-flash")
+	require.NoError(t, err)
+	require.NotContains(t, string(textBody), imageData)
+	require.Len(t, images, 1)
+	require.Len(t, upstream.requests, 1)
+	require.Equal(t, source, gjson.GetBytes(upstream.bodies[0], "input.0.content.1.image_url").String())
+	encrypted, err := svc.sealDeepSeekCompactState(deepSeekCompactTestContext(42), deepSeekCompactEnvelope{Checkpoint: "summary", Images: images})
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(encrypted), deepSeekCompactMaxEnvelopeBytes)
+	state, err := svc.openDeepSeekCompactState(deepSeekCompactTestContext(42), encrypted)
+	require.NoError(t, err)
+	require.Empty(t, state.Images[0].Original)
 }
 
 func TestDeepSeekCompactImagesDropsForeignCompaction(t *testing.T) {
@@ -241,11 +363,23 @@ func TestDeepSeekCompactImagesNearLimitReuseAndAliases(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, images, reused)
 		require.Len(t, upstream.requests, 1)
-		_, err = svc.sealDeepSeekCompactState(deepSeekCompactTestContext(42), deepSeekCompactEnvelope{Checkpoint: strings.Repeat("x", deepSeekCompactMaxSummaryBytes), Images: images})
-		if len(part) > 60000 {
-			require.Error(t, err, "actual final capsule size must still be enforced")
+	}
+}
+
+func TestDeepSeekCompactImagesStillEnforcePersistedCapsuleLimit(t *testing.T) {
+	svc, _ := compactImagesService()
+	images := make([]deepSeekCompactImage, compactImageMaxCount)
+	for i := range images {
+		images[i] = deepSeekCompactImage{
+			ID:          compactImageDigest("image-" + strings.Repeat("x", i+1)),
+			Description: strings.Repeat("d", compactImageDescriptionLimit),
 		}
 	}
+	_, err := svc.sealDeepSeekCompactState(deepSeekCompactTestContext(42), deepSeekCompactEnvelope{
+		Checkpoint: strings.Repeat("c", deepSeekCompactMaxSummaryBytes),
+		Images:     images,
+	})
+	require.ErrorContains(t, err, "encrypted_content exceeds")
 }
 
 func TestDeepSeekCompactImagesForwardEntrypoints(t *testing.T) {
